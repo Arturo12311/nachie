@@ -1,0 +1,752 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import random
+import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit, urlunsplit
+
+import requests
+import gspread
+from zoneinfo import ZoneInfo
+
+
+DEFAULT_APIFY_ACTOR = "e-commerce/walmart-product-detail-scraper"
+
+BASE_REQUIRED_CONFIG_KEYS = [
+    "target_seller",
+    "apify_token",
+    "google_service_account_json",
+    "google_sheet_id",
+    "sheet_tab",
+]
+
+# Supports your requested key names + a legacy fallback for monitor
+ALERT_WEBHOOK_KEYS = ["main_discord_webhook_alerts", "discord_webhook_alerts"]
+MONITOR_WEBHOOK_KEYS = ["discord_webhook_monitor_errors", "discord_webhook_monitor", "discord_webhook"]  # legacy fallback
+
+
+# -------------------------
+# Logging + small helpers
+# -------------------------
+
+def log(msg: str) -> None:
+    print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {msg}", flush=True)
+
+def canon_url(url: str) -> str:
+    url = (url or "").strip()
+    if not url:
+        return ""
+    p = urlsplit(url)
+    scheme = p.scheme or "https"
+    netloc = (p.netloc or "").lower()
+    path = (p.path or "").rstrip("/")
+    return urlunsplit((scheme, netloc, path, "", ""))
+
+def looks_like_walmart_ca(url: str) -> bool:
+    url = (url or "").strip().lower()
+    if not (url.startswith("http://") or url.startswith("https://")):
+        return False
+    try:
+        netloc = urlsplit(url).netloc.lower()
+    except Exception:
+        return False
+    return netloc.endswith("walmart.ca")
+
+def norm_seller(s: str) -> str:
+    return " ".join((s or "").strip().lower().split())
+
+def parse_bool(v: Any, default: bool = False) -> bool:
+    # blank cell -> default (prevents accidental disabling)
+    if v is None:
+        return default
+    s = str(v).strip().lower()
+    if s == "":
+        return default
+    if s in ("1", "true", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "no", "n", "off"):
+        return False
+    return default
+
+def pick_cfg(cfg: dict, keys: List[str]) -> str:
+    for k in keys:
+        v = str(cfg.get(k, "")).strip()
+        if v:
+            return v
+    return ""
+
+def atomic_write_json(path: Path, data: dict) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+
+
+# -------------------------
+# Discord (two webhooks)
+# -------------------------
+
+def discord_post(webhook: str, msg: str) -> None:
+    r = requests.post(webhook, json={"content": msg}, timeout=20)
+    r.raise_for_status()
+
+
+# -------------------------
+# Active hours (Toronto by default)
+# -------------------------
+
+def in_active_window(dt_local: datetime, start_hour: int, end_hour: int) -> bool:
+    h = dt_local.hour + dt_local.minute / 60.0
+    return start_hour <= h < end_hour
+
+def seconds_until_next_start(dt_local: datetime, start_hour: int) -> int:
+    today_start = dt_local.replace(hour=start_hour, minute=0, second=0, microsecond=0)
+    if dt_local < today_start:
+        nxt = today_start
+    else:
+        nxt = today_start + timedelta(days=1)
+    return max(30, int((nxt - dt_local).total_seconds()))
+
+def align_to_active(epoch: float, tz: ZoneInfo, start_hour: int, end_hour: int) -> float:
+    dt = datetime.fromtimestamp(epoch, tz)
+    if in_active_window(dt, start_hour, end_hour):
+        return epoch
+
+    start_today = dt.replace(hour=start_hour, minute=0, second=0, microsecond=0)
+    if dt.hour < start_hour:
+        return start_today.timestamp()
+
+    nxt = start_today + timedelta(days=1)
+    return nxt.timestamp()
+
+
+# -------------------------
+# Google Sheets
+# -------------------------
+
+REQUIRED_SHEET_COLS = [
+    "name",
+    "url", "important", "active",
+    "valid", "last_seller", "last_price", "last_checked", "last_error",
+]
+
+@dataclass
+class SheetRow:
+    row_num: int
+    url_raw: str
+    url_canon: str
+    important: bool
+    active: bool
+
+
+class SheetClient:
+    def __init__(self, service_account_json: str, sheet_id: str, tab_name: str):
+        self.gc = gspread.service_account(filename=service_account_json)
+        self.sheet = self.gc.open_by_key(sheet_id)
+        self.ws = self.sheet.worksheet(tab_name)
+
+        self.headers = self.ws.row_values(1)
+        self.hmap = {h.strip().lower(): i for i, h in enumerate(self.headers)}  # 0-based
+
+        if "url" not in self.hmap:
+            raise RuntimeError("Sheet must have a header column named: url")
+
+        self.ensure_columns(REQUIRED_SHEET_COLS)
+
+    @staticmethod
+    def col_letter(n1: int) -> str:
+        s = ""
+        n = n1
+        while n > 0:
+            n, r = divmod(n - 1, 26)
+            s = chr(65 + r) + s
+        return s
+
+    def ensure_columns(self, required: List[str]) -> None:
+        headers = self.ws.row_values(1)
+        lower = [h.strip().lower() for h in headers]
+        changed = False
+
+        for col in required:
+            if col not in lower:
+                headers.append(col)
+                lower.append(col)
+                changed = True
+
+        if changed:
+            last_col = self.col_letter(len(headers))
+            rng = f"A1:{last_col}1"
+            self.ws.update(rng, [headers], value_input_option="RAW")
+            self.headers = headers
+            self.hmap = {h.strip().lower(): i for i, h in enumerate(headers)}
+            log("Added missing sheet columns automatically.")
+
+    def _idx(self, name: str) -> Optional[int]:
+        return self.hmap.get(name.strip().lower())
+
+    def read_rows(self) -> List[SheetRow]:
+        values = self.ws.get_all_values()
+        if len(values) < 2:
+            return []
+
+        url_i = self._idx("url")
+        imp_i = self._idx("important")
+        act_i = self._idx("active")
+
+        out: List[SheetRow] = []
+        for rnum in range(2, len(values) + 1):
+            row = values[rnum - 1]
+
+            url_raw = row[url_i].strip() if url_i is not None and url_i < len(row) else ""
+            if not url_raw:
+                continue
+
+            important = parse_bool(row[imp_i], default=False) if imp_i is not None and imp_i < len(row) else False
+            active = parse_bool(row[act_i], default=True) if act_i is not None and act_i < len(row) else True
+
+            cu = canon_url(url_raw)
+            out.append(SheetRow(rnum, url_raw, cu, important, active))
+
+        return out
+
+    def batch_write(self, updates: List[Tuple[int, str, Any]]) -> None:
+        """
+        Worksheet.batch_update() already targets the worksheet, so ranges must be like "H2", not "Sheet1!H2".
+        """
+        data = []
+        for row_num, col_name, val in updates:
+            idx0 = self._idx(col_name)
+            if idx0 is None:
+                continue
+            col_letter = self.col_letter(idx0 + 1)
+            rng = f"{col_letter}{row_num}"
+            data.append({"range": rng, "values": [[str(val) if val is not None else ""]]})
+
+        if data:
+            self.ws.batch_update(data, value_input_option="RAW")
+
+
+# -------------------------
+# Apify (async flow)
+# -------------------------
+
+def actor_to_apify_id(actor: str) -> str:
+    actor = actor.strip()
+    if "~" in actor:
+        return actor
+    if "/" in actor:
+        a, b = actor.split("/", 1)
+        return f"{a}~{b}"
+    return actor
+
+class ApifyClient:
+    def __init__(self, token: str):
+        self.base = "https://api.apify.com/v2"
+        self.s = requests.Session()
+        self.s.headers.update({"Authorization": f"Bearer {token}"})
+
+    def _request(self, method: str, url: str, *, params=None, json_body=None, timeout=(30, 60), tries: int = 4):
+        # Small reliability improvement: retry transient gateway errors (reduces random 502/503/504)
+        delays = [0, 5, 15, 30]
+        last_err: Optional[Exception] = None
+
+        for attempt in range(tries):
+            if attempt > 0:
+                time.sleep(delays[min(attempt, len(delays) - 1)])
+            try:
+                r = self.s.request(method, url, params=params, json=json_body, timeout=timeout)
+                if r.status_code in (502, 503, 504):
+                    last_err = RuntimeError(f"{r.status_code} {r.reason}")
+                    continue
+                r.raise_for_status()
+                return r
+            except Exception as e:
+                last_err = e
+                continue
+
+        raise last_err if last_err else RuntimeError("Unknown Apify request failure")
+
+    def start_run(self, actor_id: str, actor_input: dict) -> dict:
+        url = f"{self.base}/acts/{actor_id}/runs"
+        r = self._request("POST", url, json_body=actor_input, timeout=(30, 120))
+        j = r.json()
+        return j.get("data", j)
+
+    def get_run(self, run_id: str) -> dict:
+        url = f"{self.base}/actor-runs/{run_id}"
+        r = self._request("GET", url, timeout=(30, 60))
+        j = r.json()
+        return j.get("data", j)
+
+    def get_run_dataset_items(self, run_id: str) -> List[dict]:
+        url = f"{self.base}/actor-runs/{run_id}/dataset/items"
+        params = {"format": "json", "clean": "true"}
+        r = self._request("GET", url, params=params, timeout=(30, 120))
+        data = r.json()
+        if not isinstance(data, list):
+            raise RuntimeError(f"Unexpected dataset items response: {type(data)}")
+        return data
+
+def apify_run_and_get_items(
+    client: ApifyClient,
+    actor: str,
+    urls: List[str],
+    max_wait_seconds: int,
+    poll_seconds: int,
+) -> List[dict]:
+    actor_id = actor_to_apify_id(actor)
+
+    actor_input = {
+        "startUrls": [{"url": u} for u in urls],
+        "maxProductsPerStartUrl": 1,
+        "enqueueProductVariants": False,
+    }
+
+    run = client.start_run(actor_id, actor_input)
+    run_id = run.get("id") or ""
+    if not run_id:
+        raise RuntimeError("Apify start_run did not return run id")
+
+    start = time.time()
+    status = (run.get("status") or "").upper()
+
+    while status not in ("SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT", "TIMEOUT"):
+        if time.time() - start > max_wait_seconds:
+            raise RuntimeError(f"Apify run exceeded max_wait_seconds ({max_wait_seconds}s). runId={run_id}")
+        time.sleep(poll_seconds)
+        run = client.get_run(run_id)
+        status = (run.get("status") or "").upper()
+
+    if status != "SUCCEEDED":
+        raise RuntimeError(f"Apify run ended with status={status}. runId={run_id}")
+
+    return client.get_run_dataset_items(run_id)
+
+def extract_fields(item: dict) -> Tuple[str, str, str, str]:
+    url = (item.get("url") or "").strip()
+    title = (item.get("name") or "").strip()
+    seller = (item.get("sellerName") or "").strip()
+    price_info = item.get("priceInfo") or {}
+    price = (price_info.get("priceDisplay") or "") or (
+        str(price_info.get("price")) if price_info.get("price") is not None else ""
+    )
+    return url, title, seller, str(price).strip()
+
+
+# -------------------------
+# State
+# -------------------------
+
+def load_state(path: str) -> dict:
+    p = Path(path)
+    if not p.exists():
+        return {"items": {}}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {"items": {}}
+
+def save_state(path: str, state: dict) -> None:
+    atomic_write_json(Path(path), state)
+
+
+# -------------------------
+# Scheduling
+# -------------------------
+
+def schedule_next(
+    now: float,
+    tz: ZoneInfo,
+    start_hour: int,
+    end_hour: int,
+    important: bool,
+    important_interval: int,
+    unimportant_daily_jitter_sec: int,
+    jitter_sec: int,
+) -> float:
+    if important:
+        nxt = now + important_interval + random.randint(0, jitter_sec)
+        return align_to_active(nxt, tz, start_hour, end_hour)
+
+    dt = datetime.fromtimestamp(now, tz)
+    next_day_start = dt.replace(hour=start_hour, minute=0, second=0, microsecond=0) + timedelta(days=1)
+    nxt = next_day_start.timestamp() + random.randint(0, unimportant_daily_jitter_sec)
+    return align_to_active(nxt, tz, start_hour, end_hour)
+
+
+# -------------------------
+# Config
+# -------------------------
+
+def load_config(path: str = "config.json") -> dict:
+    p = Path(path)
+    if not p.exists():
+        raise SystemExit(f"Missing {path}")
+    cfg = json.loads(p.read_text(encoding="utf-8"))
+
+    for k in BASE_REQUIRED_CONFIG_KEYS:
+        if not str(cfg.get(k, "")).strip():
+            raise SystemExit(f"config.json missing required key: {k}")
+
+    alert_wh = pick_cfg(cfg, ALERT_WEBHOOK_KEYS)
+    monitor_wh = pick_cfg(cfg, MONITOR_WEBHOOK_KEYS)
+
+    if not alert_wh:
+        raise SystemExit("config.json missing required key: main_discord_webhook_alerts (or discord_webhook_alerts)")
+    if not monitor_wh:
+        raise SystemExit("config.json missing required key: discord_webhook_monitor_errors (or discord_webhook_monitor)")
+
+    return cfg
+
+
+# -------------------------
+# Doctor
+# -------------------------
+
+def run_doctor(sheet: SheetClient, send_monitor, tz: ZoneInfo) -> None:
+    rows = sheet.read_rows()
+    log(f"DOCTOR: sheet rows with URLs: {len(rows)}")
+
+    if not rows:
+        log("DOCTOR: No URLs found in sheet. Add at least one URL in 'url' column.")
+        send_monitor("⚠️ DOCTOR: No URLs found in sheet (nothing to test).")
+        return
+
+    r = rows[0]
+    now_str = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+
+    try:
+        sheet.batch_write([
+            (r.row_num, "last_checked", now_str),
+            (r.row_num, "last_error", f"DOCTOR OK {now_str}")
+        ])
+        log("DOCTOR: wrote DOCTOR OK into sheet.")
+        send_monitor("✅ DOCTOR OK: Google Sheet write works and bot can update rows.")
+    except Exception as e:
+        log(f"DOCTOR: sheet write failed: {e}")
+        send_monitor(f"⚠️ DOCTOR FAILED: Google Sheet write error: {e}")
+
+
+# -------------------------
+# Main
+# -------------------------
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--doctor", action="store_true")
+    ap.add_argument("--once", action="store_true")
+    ap.add_argument("--force", action="store_true", help="Check all ACTIVE links now (ignores schedule + active-hours)")
+    args = ap.parse_args()
+
+    cfg = load_config("config.json")
+
+    alert_webhook = pick_cfg(cfg, ALERT_WEBHOOK_KEYS)
+    monitor_webhook = pick_cfg(cfg, MONITOR_WEBHOOK_KEYS)
+
+    def send_monitor(msg: str) -> None:
+        try:
+            discord_post(monitor_webhook, msg)
+        except Exception as e:
+            log(f"MONITOR WEBHOOK FAILED: {e}")
+
+    def send_alert(msg: str) -> None:
+        # Alerts webhook ONLY used for undercut alerts.
+        try:
+            discord_post(alert_webhook, msg)
+        except Exception as e:
+            log(f"ALERT WEBHOOK FAILED: {e}")
+            safe_msg = msg.replace("@everyone", "(everyone)")
+            send_monitor(f"⚠️ Failed to send UNDERCUT alert to alerts channel: {e}\n\nAlert (no ping):\n{safe_msg}")
+
+    tz = ZoneInfo(cfg.get("active_timezone", "America/Toronto"))
+    start_hour = int(cfg.get("active_start_hour", 7))
+    end_hour = int(cfg.get("active_end_hour", 24))
+
+    important_interval = int(cfg.get("important_interval_seconds", 3600))
+    jitter_sec = int(cfg.get("jitter_seconds", 30))
+
+    retry_imp = int(cfg.get("retry_seconds_important", 7200))        # 2h
+    retry_unimp = int(cfg.get("retry_seconds_unimportant", 43200))   # 12h
+
+    unimportant_daily_jitter_sec = int(cfg.get("unimportant_daily_jitter_seconds", 7200))
+    max_batch = int(cfg.get("max_batch", 10))
+    loop_sleep = int(cfg.get("loop_sleep_seconds", 60))
+
+    apify_token = cfg["apify_token"].strip()
+    apify_actor = cfg.get("apify_actor", DEFAULT_APIFY_ACTOR).strip()
+    apify_poll_seconds = int(cfg.get("apify_poll_seconds", 10))
+    apify_max_wait_seconds = int(cfg.get("apify_max_wait_seconds", 3600))
+
+    target_seller = cfg["target_seller"].strip()
+    target_norm = norm_seller(target_seller)
+
+    state_file = cfg.get("state_file", "state.json")
+    state = load_state(state_file)
+    state.setdefault("items", {})
+    items: Dict[str, dict] = state["items"]
+
+    sheet = SheetClient(cfg["google_service_account_json"], cfg["google_sheet_id"], cfg["sheet_tab"])
+    apify = ApifyClient(apify_token)
+
+    # Monitor-only messages (never spam client channel)
+    send_monitor(
+        "✅ Walmart Undercut Bot started\n"
+        f"Target seller: {target_seller}\n"
+        f"Active hours: {start_hour}:00–{end_hour}:00 ({cfg.get('active_timezone','America/Toronto')})\n"
+    )
+
+    if args.doctor:
+        run_doctor(sheet, send_monitor, tz)
+        return
+
+    log("Bot running (two-webhook mode).")
+    log(f"max_batch={max_batch} poll={apify_poll_seconds}s max_wait={apify_max_wait_seconds}s")
+
+    while True:
+        try:
+            now_local = datetime.now(tz)
+
+            if (not args.force) and (not in_active_window(now_local, start_hour, end_hour)):
+                sleep_for = seconds_until_next_start(now_local, start_hour)
+                log(f"Outside active hours. Sleeping {sleep_for}s.")
+                time.sleep(sleep_for)
+                if args.once:
+                    return
+                continue
+
+            try:
+                rows = sheet.read_rows()
+            except Exception as e:
+                log(f"Google Sheet read error: {e}")
+                send_monitor(f"⚠️ Google Sheet read error: {e}")
+                time.sleep(60)
+                if args.once:
+                    return
+                continue
+
+            if not rows:
+                log("No URLs found in sheet. Sleeping 300s.")
+                time.sleep(300)
+                if args.once:
+                    return
+                continue
+
+            now = time.time()
+
+            for r in rows:
+                if r.url_canon and r.url_canon not in items:
+                    items[r.url_canon] = {
+                        "last_seller_raw": "",
+                        "last_seller_norm": "",
+                        "last_price": "",
+                        "next_check": 0,
+                        "no_data_streak": 0,
+                        "last_important": r.important,
+                        "last_active": r.active,
+                    }
+
+            due: List[SheetRow] = []
+            updates: List[Tuple[int, str, Any]] = []
+
+            active_count = 0
+            invalid_count = 0
+
+            # If important/active gets changed in the sheet, apply it immediately
+            for r in rows:
+                if not r.url_canon:
+                    continue
+                st = items.get(r.url_canon)
+                if not st:
+                    continue
+
+                if bool(st.get("last_active", True)) != bool(r.active):
+                    st["last_active"] = r.active
+                    if r.active:
+                        st["next_check"] = 0
+                    else:
+                        st["next_check"] = now + 10 * 365 * 24 * 3600
+
+                if bool(st.get("last_important", False)) != bool(r.important):
+                    st["last_important"] = r.important
+                    if r.important:
+                        st["next_check"] = 0
+                    else:
+                        st["next_check"] = schedule_next(
+                            now, tz, start_hour, end_hour,
+                            important=False,
+                            important_interval=important_interval,
+                            unimportant_daily_jitter_sec=unimportant_daily_jitter_sec,
+                            jitter_sec=jitter_sec,
+                        )
+
+            for r in rows:
+                if not r.active:
+                    continue
+                active_count += 1
+
+                if not looks_like_walmart_ca(r.url_raw):
+                    invalid_count += 1
+                    updates += [
+                        (r.row_num, "valid", "FALSE"),
+                        (r.row_num, "last_checked", now_local.strftime("%Y-%m-%d %H:%M:%S")),
+                        (r.row_num, "last_error", "Invalid URL (must be walmart.ca)"),
+                    ]
+                    continue
+
+                st = items.get(r.url_canon, {})
+                nxt = float(st.get("next_check") or 0)
+                if args.force or nxt <= now:
+                    due.append(r)
+
+            if updates:
+                try:
+                    sheet.batch_write(updates)
+                except Exception as e:
+                    log(f"Google Sheet write error: {e}")
+                    send_monitor(f"⚠️ Google Sheet write error: {e}")
+                updates = []
+
+            log(f"Loaded {len(rows)} URLs | active={active_count} | invalid={invalid_count} | due={len(due)}")
+
+            if not due:
+                save_state(state_file, state)
+                if args.once:
+                    return
+                time.sleep(min(600, max(loop_sleep, 60)))
+                continue
+
+            random.shuffle(due)
+
+            for i in range(0, len(due), max_batch):
+                batch = due[i:i + max_batch]
+                batch_urls = [r.url_raw for r in batch]
+                log(f"Calling Apify (async) for {len(batch)} URLs...")
+
+                try:
+                    apify_items = apify_run_and_get_items(
+                        apify,
+                        apify_actor,
+                        batch_urls,
+                        max_wait_seconds=apify_max_wait_seconds,
+                        poll_seconds=apify_poll_seconds,
+                    )
+                except Exception as e:
+                    err = str(e)
+                    log(f"Apify error: {err}")
+                    send_monitor(f"⚠️ Apify error: {err}")
+
+                    now = time.time()
+                    for r in batch:
+                        st = items[r.url_canon]
+                        retry = retry_imp if r.important else retry_unimp
+                        st["next_check"] = align_to_active(now + retry, tz, start_hour, end_hour)
+                        updates += [
+                            (r.row_num, "last_checked", datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")),
+                            (r.row_num, "last_error", err),
+                        ]
+                    try:
+                        sheet.batch_write(updates)
+                    except Exception as e2:
+                        log(f"Google Sheet write error: {e2}")
+                        send_monitor(f"⚠️ Google Sheet write error: {e2}")
+                    updates = []
+                    save_state(state_file, state)
+                    continue
+
+                returned: Dict[str, dict] = {}
+                for it in apify_items:
+                    url_out, title, seller, price = extract_fields(it)
+                    cu = canon_url(url_out)
+                    if cu and cu not in returned:
+                        returned[cu] = {"title": title, "seller": seller, "price": price}
+
+                now = time.time()
+                for r in batch:
+                    st = items[r.url_canon]
+                    data = returned.get(r.url_canon)
+
+                    if not data:
+                        st["no_data_streak"] = int(st.get("no_data_streak") or 0) + 1
+                        msg = "No data returned (not found / unavailable)"
+                        retry = retry_imp if r.important else retry_unimp
+                        st["next_check"] = align_to_active(now + retry, tz, start_hour, end_hour)
+
+                        if st["no_data_streak"] >= 2:
+                            updates.append((r.row_num, "valid", "FALSE"))
+
+                        updates += [
+                            (r.row_num, "last_checked", datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")),
+                            (r.row_num, "last_error", msg),
+                        ]
+                        continue
+
+                    title = data["title"]
+                    seller_raw = data["seller"]
+                    price = data["price"]
+
+                    cur_norm = norm_seller(seller_raw)
+                    prev_norm = st.get("last_seller_norm", "")
+
+                    # UNDERCUT ALERT (ONLY message that goes to the alerts webhook)
+                    if prev_norm == target_norm and cur_norm and cur_norm != target_norm:
+                        alert = (
+                            f"@everyone ⚠️ UNDERCUT ALERT\n"
+                            f"{title or 'Walmart item'}\n"
+                            f"{r.url_raw}\n"
+                            f"Was: {st.get('last_seller_raw','')} @ {st.get('last_price','') or 'N/A'}\n"
+                            f"Now: {seller_raw} @ {price or 'N/A'}\n"
+                            f"Time: {datetime.now(tz).strftime('%Y-%m-%d %H:%M:%S')} Toronto"
+                        )
+                        send_alert(alert)
+
+                    st["last_seller_raw"] = seller_raw
+                    st["last_seller_norm"] = cur_norm
+                    st["last_price"] = price
+                    st["no_data_streak"] = 0
+
+                    st["next_check"] = schedule_next(
+                        now, tz, start_hour, end_hour,
+                        important=r.important,
+                        important_interval=important_interval,
+                        unimportant_daily_jitter_sec=unimportant_daily_jitter_sec,
+                        jitter_sec=jitter_sec
+                    )
+
+                    updates += [
+                        (r.row_num, "valid", "TRUE"),
+                        (r.row_num, "last_seller", seller_raw),
+                        (r.row_num, "last_price", price),
+                        (r.row_num, "last_checked", datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")),
+                        (r.row_num, "last_error", ""),
+                    ]
+
+                if updates:
+                    try:
+                        sheet.batch_write(updates)
+                    except Exception as e:
+                        log(f"Google Sheet write error: {e}")
+                        send_monitor(f"⚠️ Google Sheet write error: {e}")
+                    updates = []
+
+                save_state(state_file, state)
+
+            if args.once:
+                log("Done (once mode).")
+                return
+
+            time.sleep(loop_sleep)
+
+        except KeyboardInterrupt:
+            log("Stopped.")
+            return
+        except Exception as fatal:
+            log(f"FATAL error: {fatal}")
+            send_monitor(f"⚠️ FATAL error (bot will keep retrying): {fatal}")
+            time.sleep(60)
+
+
+if __name__ == "__main__":
+    main()
