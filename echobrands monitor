@@ -1,0 +1,327 @@
+import json
+import os
+import random
+import threading
+import time
+from pathlib import Path
+from typing import Optional, Any
+
+import requests
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+
+PRODUCTS_URL = "https://echobrands.com/products/"
+LOGIN_URL = "https://echobrands.com/my-account/"
+ADMIN_AJAX_PATH = "/wp-admin/admin-ajax.php"
+TARGET_ACTION = "wcpt_load_products"
+
+DEFAULT_TIMEOUT_MS = 60_000
+MAX_CONSECUTIVE_ERRORS_BEFORE_CONTEXT_RESTART = 10
+
+
+def ts() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def log(msg: str) -> None:
+    print(f"{ts()}  {msg}", flush=True)
+
+
+def load_config(path: str = "config.json") -> dict:
+    p = Path(path)
+    if not p.exists():
+        raise SystemExit(f"Missing {path}. Create it first.")
+    with p.open("r", encoding="utf-8") as f:
+        cfg = json.load(f)
+
+    if not (cfg.get("webhook") or "").strip():
+        raise SystemExit("config.json missing required key: webhook")
+
+    return cfg
+
+
+def load_last_count(state_file: str) -> Optional[int]:
+    p = Path(state_file)
+    if not p.exists():
+        return None
+    try:
+        with p.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        v = data.get("last_count")
+        return int(v) if v is not None else None
+    except Exception:
+        return None
+
+
+def save_last_count(state_file: str, count: int) -> None:
+    p = Path(state_file)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump({"last_count": int(count), "updated_at": ts()}, f)
+    tmp.replace(p)
+
+
+def discord_alert(webhook: str, msg: str) -> None:
+    r = requests.post(webhook, json={"content": msg}, timeout=20)
+    r.raise_for_status()
+
+
+def parse_bool(val: Any, default: bool = True) -> bool:
+    if val is None:
+        return default
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return bool(val)
+    if isinstance(val, str):
+        s = val.strip().lower()
+        return s not in ("0", "false", "no", "off")
+    return bool(val)
+
+
+def is_wcpt_products_request(req) -> bool:
+    try:
+        if ADMIN_AJAX_PATH not in req.url:
+            return False
+        if req.method != "POST":
+            return False
+        post = req.post_data or ""
+        return f"action={TARGET_ACTION}" in post
+    except Exception:
+        return False
+
+
+def maybe_accept_cookies(page) -> None:
+    try:
+        btn = page.locator('button:has-text("Accept"), a:has-text("Accept")')
+        if btn.count() > 0:
+            btn.first.click(timeout=1500)
+    except Exception:
+        pass
+
+
+def do_login(page, username: str, password: str) -> None:
+    if not username or not password:
+        raise RuntimeError("Logged out but no username/password provided in config.json.")
+
+    log("Logging in…")
+    page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT_MS)
+    maybe_accept_cookies(page)
+
+    user_sel = "input#username, input[name='username'], input[name='log']"
+    pass_sel = "input#password, input[name='password']"
+    submit_sel = "button[name='login'], button.woocommerce-button, button[type='submit'], input[type='submit']"
+    remember_sel = "input#rememberme, input[name='rememberme']"
+
+    page.wait_for_selector(user_sel, timeout=15_000)
+    page.fill(user_sel, username)
+    page.fill(pass_sel, password)
+
+    try:
+        page.check(remember_sel, timeout=1000)
+    except Exception:
+        pass
+
+    page.click(submit_sel)
+    page.wait_for_load_state("networkidle", timeout=DEFAULT_TIMEOUT_MS)
+
+    page.goto(PRODUCTS_URL, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT_MS)
+    maybe_accept_cookies(page)
+
+    if page.locator("text=Please login to view products").count() > 0:
+        raise RuntimeError("Login failed (still seeing 'Please login to view products'). Check credentials.")
+
+    log("Login OK.")
+
+
+def fetch_records_total(page, username: str, password: str) -> int:
+    for attempt in range(2):
+        try:
+            with page.expect_request(is_wcpt_products_request, timeout=DEFAULT_TIMEOUT_MS) as req_info:
+                page.goto(PRODUCTS_URL, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT_MS)
+
+            maybe_accept_cookies(page)
+
+            req = req_info.value
+            post_data = req.post_data or ""
+
+            api_resp = page.context.request.post(
+                req.url,
+                data=post_data,
+                headers={
+                    "accept": "application/json, text/javascript, */*; q=0.01",
+                    "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "origin": "https://echobrands.com",
+                    "referer": PRODUCTS_URL,
+                    "x-requested-with": "XMLHttpRequest",
+                },
+                timeout=DEFAULT_TIMEOUT_MS,
+            )
+
+            body = (api_resp.text() or "").strip()
+            if body == "0":
+                raise RuntimeError("admin-ajax returned '0' (likely logged out / nonce invalid).")
+
+            try:
+                data = api_resp.json()
+            except Exception:
+                data = json.loads(body)
+
+            if "recordsTotal" not in data:
+                raise RuntimeError(f"AJAX JSON missing recordsTotal. Keys: {list(data.keys())[:20]}")
+
+            return int(data["recordsTotal"])
+
+        except PlaywrightTimeoutError:
+            # If gated, login and retry
+            if page.locator("text=Please login to view products").count() > 0:
+                do_login(page, username, password)
+                continue
+            raise
+
+        except RuntimeError as e:
+            if "admin-ajax returned '0'" in str(e) and attempt == 0:
+                do_login(page, username, password)
+                continue
+            raise
+
+    raise RuntimeError("Failed to fetch recordsTotal after re-login attempt.")
+
+
+def main() -> None:
+    cfg = load_config("config.json")
+
+    webhook = (cfg.get("webhook") or "").strip()
+    username = (cfg.get("username") or "").strip()
+    password = (cfg.get("password") or "").strip()
+
+    poll_seconds = int(cfg.get("poll_seconds", 600))
+    jitter_seconds = int(cfg.get("jitter_seconds", 45))
+    headless = parse_bool(cfg.get("headless", True), default=True)
+    state_file = str(cfg.get("state_file", "state.json"))
+    user_data_dir = str(cfg.get("user_data_dir", "pw-user-data"))
+
+    # ✅ Watchdog: kills the whole process if the loop stops making progress.
+    # Uses monotonic time so clock changes don't break it.
+    hang_limit = int(cfg.get("hang_limit_seconds", max(1200, poll_seconds * 2)))
+    last_activity = [time.monotonic()]
+
+    def touch():
+        last_activity[0] = time.monotonic()
+
+    def watchdog():
+        while True:
+            time.sleep(60)
+            age = time.monotonic() - last_activity[0]
+            if age > hang_limit:
+                log(f"WATCHDOG: no activity for {int(age)}s (limit={hang_limit}s). Exiting for restart.")
+                os._exit(1)
+
+    threading.Thread(target=watchdog, daemon=True).start()
+
+    last = load_last_count(state_file)
+    failures = 0
+
+    log(
+        f"Starting monitor. headless={headless} poll={poll_seconds}s jitter=±{jitter_seconds}s "
+        f"state={state_file} hang_limit={hang_limit}s"
+    )
+
+    while True:
+        try:
+            with sync_playwright() as p:
+                # Relaunch the browser context if we break out (too many errors)
+                while True:
+                    context = p.chromium.launch_persistent_context(
+                        user_data_dir=user_data_dir,
+                        headless=headless,
+                        viewport={"width": 1280, "height": 720},
+                    )
+                    try:
+                        page = context.new_page()
+                        page.set_default_timeout(DEFAULT_TIMEOUT_MS)
+                        page.set_default_navigation_timeout(DEFAULT_TIMEOUT_MS)
+
+                        try:
+                            page.route(
+                                "**/*",
+                                lambda route: route.abort()
+                                if route.request.resource_type in ("image", "font")
+                                else route.continue_(),
+                            )
+                        except Exception:
+                            pass
+
+                        while True:
+                            touch()
+                            try:
+                                cur = fetch_records_total(page, username, password)
+                                touch()
+
+                                if failures >= 3:
+                                    try:
+                                        discord_alert(webhook, f"✅ Monitor recovered after {failures} failures. recordsTotal={cur}")
+                                    except Exception:
+                                        pass
+                                failures = 0
+
+                                log(f"Checked: recordsTotal={cur}  (last={last})")
+
+                                if last is None:
+                                    last = cur
+                                    save_last_count(state_file, last)
+                                    log(f"Initialized last_count={last}")
+                                elif cur != last:
+                                    discord_alert(webhook, f"@everyone ✅ Product count changed: {last} → {cur}")
+                                    last = cur
+                                    save_last_count(state_file, last)
+                                    log(f"Changed -> {last}")
+                                else:
+                                    log("No change.")
+                                    save_last_count(state_file, last)  # heartbeat
+
+                                sleep_for = poll_seconds + (random.randint(-jitter_seconds, jitter_seconds) if jitter_seconds else 0)
+                                sleep_for = max(30, sleep_for)
+                                log(f"Sleeping {sleep_for}s")
+                                time.sleep(sleep_for)
+
+                            except KeyboardInterrupt:
+                                raise
+
+                            except Exception as e:
+                                touch()
+                                failures += 1
+                                log(f"ERROR (#{failures}): {e}")
+
+                                if failures == 3 or (failures > 3 and failures % 6 == 0):
+                                    try:
+                                        discord_alert(webhook, f"⚠️ Monitor failing (x{failures}): {e}")
+                                    except Exception:
+                                        pass
+
+                                if failures >= MAX_CONSECUTIVE_ERRORS_BEFORE_CONTEXT_RESTART:
+                                    log("Too many consecutive errors; restarting browser context.")
+                                    break  # break inner loop -> close context -> relaunch
+
+                                time.sleep(60)
+
+                    finally:
+                        try:
+                            context.close()
+                        except Exception:
+                            pass
+
+        except KeyboardInterrupt:
+            log("Stopped.")
+            return
+
+        except Exception as fatal:
+            log(f"FATAL Playwright error: {fatal}  (restarting in 30s)")
+            try:
+                discord_alert(webhook, f"⚠️ Bot restarting after fatal error: {fatal}")
+            except Exception:
+                pass
+            time.sleep(30)
+
+
+if __name__ == "__main__":
+    main()
